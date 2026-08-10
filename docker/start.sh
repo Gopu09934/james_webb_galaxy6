@@ -57,6 +57,23 @@ SUB_ICON_Y=677
 SUB_ICON_R=20
 
 #############################################
+# Right-hand info panel (Mission Details +
+# Environmental Data) — mirrors the left
+# panel's visual language but sits on the right
+# edge, and only runs down to y=610 so it never
+# overlaps the existing CTA box / bottom ticker
+# / subscribe-ring elements built later in
+# build_final_filter().
+#############################################
+RIGHT_PANEL_X=933      # left edge of the right panel (panel runs to x=1280)
+RIGHT_PANEL_W=347
+RIGHT_PANEL_H=610
+MARS_DATA_REFRESH=8    # seconds between simulated environmental readings
+SPARK_HISTORY=8        # how many past wind readings feed the trend sparkline
+LANDING_DATE_EPOCH=1613637480   # 2021-02-18 20:38 UTC (Perseverance touchdown) — used to compute the live Sol counter
+SOL_LENGTH_SECONDS=88775        # 1 Martian sol ≈ 24h 39m 35s
+
+#############################################
 # Up-next bumper (shown between videos)
 #############################################
 ENABLE_BUMPER=true
@@ -200,7 +217,82 @@ if [ "$SHOW_STATS" = true ]; then
     VIEWERS_PID=$!
 fi
 
-trap 'kill "$CLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true' EXIT
+#############################################
+# Background Sol-counter + simulated
+# environmental-data writer (temperature, wind
+# speed, pressure) for the new right panel.
+#
+# NOTE ON DATA SOURCE: Perseverance's MEDA
+# weather instrument doesn't expose a simple
+# public real-time JSON feed the way the
+# YouTube Data API does for subscriber counts,
+# so — unlike subs.txt/viewers.txt above — these
+# numbers are NOT pulled from a live NASA
+# reading. They're a bounded, slowly-varying
+# simulation built from published Jezero Crater
+# climate ranges, refreshed every
+# MARS_DATA_REFRESH seconds. The on-screen
+# labels are marked "(est.)" so viewers aren't
+# told this is certified live telemetry. If you
+# later get access to a real feed, swap the
+# awk-based generation below for a curl call,
+# same pattern as the subs/viewers writers.
+#
+# The Sol counter is computed for real, from the
+# actual landing timestamp (LANDING_DATE_EPOCH),
+# so that number is genuine.
+#############################################
+printf ' ' > "$ASSET_DIR/rp_sol.txt"
+printf ' ' > "$ASSET_DIR/rp_temp.txt"
+printf ' ' > "$ASSET_DIR/rp_wind.txt"
+printf ' ' > "$ASSET_DIR/rp_pressure.txt"
+printf ' ' > "$ASSET_DIR/rp_spark.txt"
+MARS_DATA_PID=""
+(
+    # ASCII-only intensity ramp for the sparkline — safer than Unicode
+    # block characters (▁▂▃▄▅▆▇█) since there's no guarantee font.ttf
+    # has those glyphs, and a missing glyph would render as a blank box.
+    SPARK_CHARS=("." ":" "-" "=" "+" "*" "#" "@")
+    HISTORY=()
+    while true; do
+        NOW_EPOCH=$(date -u +%s)
+        SOL=$(awk -v now="$NOW_EPOCH" -v landed="$LANDING_DATE_EPOCH" -v sollen="$SOL_LENGTH_SECONDS" 'BEGIN{printf "%d", (now-landed)/sollen}')
+        printf 'Sol %s' "$SOL" > "$ASSET_DIR/rp_sol.txt.tmp"
+        mv -f "$ASSET_DIR/rp_sol.txt.tmp" "$ASSET_DIR/rp_sol.txt"
+
+        HOUR=$(date -u +%H)
+        # Simple bounded day/night swing within Jezero's published range
+        # (roughly -90C overnight low to -20C midday high), plus a small
+        # random wobble so it doesn't look like a static repeating chart.
+        TEMP=$(awk -v h="$HOUR" 'BEGIN{srand(); base=-60; swing=35; printf "%d", base + swing*sin((h/24)*3.14159*2 - 1.2) + (rand()*4-2)}')
+        WIND=$(awk 'BEGIN{srand(); printf "%.1f", 2 + rand()*9}')
+        PRESSURE=$(awk 'BEGIN{srand(); printf "%d", 730 + rand()*40}')
+
+        printf 'Temp: %s C' "$TEMP" > "$ASSET_DIR/rp_temp.txt.tmp"
+        mv -f "$ASSET_DIR/rp_temp.txt.tmp" "$ASSET_DIR/rp_temp.txt"
+        printf 'Wind: %s m/s' "$WIND" > "$ASSET_DIR/rp_wind.txt.tmp"
+        mv -f "$ASSET_DIR/rp_wind.txt.tmp" "$ASSET_DIR/rp_wind.txt"
+        printf 'Pressure: %s Pa' "$PRESSURE" > "$ASSET_DIR/rp_pressure.txt.tmp"
+        mv -f "$ASSET_DIR/rp_pressure.txt.tmp" "$ASSET_DIR/rp_pressure.txt"
+
+        HISTORY+=("$WIND")
+        while [ "${#HISTORY[@]}" -gt "$SPARK_HISTORY" ]; do
+            HISTORY=("${HISTORY[@]:1}")
+        done
+        SPARK=""
+        for v in "${HISTORY[@]}"; do
+            BUCKET=$(awk -v v="$v" 'BEGIN{b=int((v/11)*7); if(b<0)b=0; if(b>7)b=7; print b}')
+            SPARK+="${SPARK_CHARS[$BUCKET]}"
+        done
+        printf '%s' "$SPARK" > "$ASSET_DIR/rp_spark.txt.tmp"
+        mv -f "$ASSET_DIR/rp_spark.txt.tmp" "$ASSET_DIR/rp_spark.txt"
+
+        sleep "$MARS_DATA_REFRESH"
+    done
+) &
+MARS_DATA_PID=$!
+
+trap 'kill "$CLOCK_PID" 2>/dev/null || true; [ -n "$SUBS_PID" ] && kill "$SUBS_PID" 2>/dev/null || true; [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true; [ -n "$MARS_DATA_PID" ] && kill "$MARS_DATA_PID" 2>/dev/null || true' EXIT
 
 #############################################
 # Static panel text (unchanged across videos)
@@ -211,6 +303,19 @@ printf "L A T E S T   M A R S   I M A G E S"  > "$ASSET_DIR/header.txt"
 printf 'LIVE FROM JEZERO CRATER'             > "$ASSET_DIR/eyebrow.txt"
 printf 'SUBSCRIBE for daily Mars discoveries' > "$ASSET_DIR/cta.txt"
 printf 'DID YOU KNOW' > "$ASSET_DIR/fact_label.txt"
+
+#############################################
+# Static right-panel text (Mission Details) —
+# same "print once at startup" pattern as the
+# left panel's static strings above.
+#############################################
+printf 'MISSION DETAILS' > "$ASSET_DIR/rp_header.txt"
+printf 'Rover: Perseverance' > "$ASSET_DIR/rp_line1.txt"
+printf 'Launched: 30 Jul 2020' > "$ASSET_DIR/rp_line2.txt"
+printf 'Landed: 18 Feb 2021' > "$ASSET_DIR/rp_line3.txt"
+printf 'Site: Jezero Crater' > "$ASSET_DIR/rp_line4.txt"
+printf 'ENVIRONMENTAL DATA (est.)' > "$ASSET_DIR/rp_env_header.txt"
+printf 'WIND TREND (est.)' > "$ASSET_DIR/rp_wind_label.txt"
 
 #############################################
 # Default headline / fact pools (used as a
@@ -641,7 +746,44 @@ prepare_video_content() {
 
     CHAIN+="[p15]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/eyebrow.txt:fontcolor=${GOLD}@0.85:fontsize=12:x=33:y=210[p16];"
 
-    local prev="p16"
+    #########################################
+    # Right panel: mission details + live
+    # environmental readout. Runs down to
+    # y=RIGHT_PANEL_H (610) — above the bottom
+    # ticker/CTA row — so it never overlaps the
+    # existing elements built in
+    # build_final_filter() below. Entirely new;
+    # everything above this block is unchanged.
+    #########################################
+    local rx=$RIGHT_PANEL_X
+    CHAIN+="[p16]drawbox=x=${rx}:y=0:w=${RIGHT_PANEL_W}:h=${RIGHT_PANEL_H}:color=black@0.60:t=fill[rp1];"
+    CHAIN+="[rp1]drawbox=x=$((rx-4)):y=0:w=4:h=${RIGHT_PANEL_H}:color=black@0.45:t=fill[rp2];"
+    CHAIN+="[rp2]drawbox=x=$((rx-8)):y=0:w=4:h=${RIGHT_PANEL_H}:color=black@0.30:t=fill[rp3];"
+    CHAIN+="[rp3]drawbox=x=${rx}:y=0:w=${RIGHT_PANEL_W}:h=4:color=${GOLD}@0.9:t=fill[rp4];"
+    CHAIN+="[rp4]drawbox=x=${rx}:y=0:w=2:h=${RIGHT_PANEL_H}:color=${GOLD}@0.6:t=fill[rp5];"
+
+    CHAIN+="[rp5]drawbox=x=$((rx+27)):y=28:w=8:h=8:color=${GOLD}:t=fill[rp6];"
+    CHAIN+="[rp6]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_header.txt:fontcolor=${GOLD}:fontsize=15:x=$((rx+43)):y=25[rp7];"
+    CHAIN+="[rp7]drawbox=x=$((rx+27)):y=55:w=294:h=2:color=white@0.3:t=fill[rp8];"
+
+    CHAIN+="[rp8]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_line1.txt:fontcolor=white@0.9:fontsize=15:x=$((rx+27)):y=70:${SHADOW}[rp9];"
+    CHAIN+="[rp9]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_line2.txt:fontcolor=white@0.9:fontsize=15:x=$((rx+27)):y=94:${SHADOW}[rp10];"
+    CHAIN+="[rp10]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_line3.txt:fontcolor=white@0.9:fontsize=15:x=$((rx+27)):y=118:${SHADOW}[rp11];"
+    CHAIN+="[rp11]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_line4.txt:fontcolor=white@0.9:fontsize=15:x=$((rx+27)):y=142:${SHADOW}[rp12];"
+    CHAIN+="[rp12]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_sol.txt:reload=1:fontcolor=${GOLD}:fontsize=15:x=$((rx+27)):y=166[rp13];"
+
+    CHAIN+="[rp13]drawbox=x=$((rx+27)):y=200:w=294:h=2:color=${GOLD}@0.4:t=fill[rp14];"
+    CHAIN+="[rp14]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_env_header.txt:fontcolor=${GOLD}@0.85:fontsize=12:x=$((rx+27)):y=212[rp15];"
+
+    CHAIN+="[rp15]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_temp.txt:reload=1:fontcolor=white:fontsize=17:x=$((rx+27)):y=236:${SHADOW}[rp16];"
+    CHAIN+="[rp16]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_wind.txt:reload=1:fontcolor=white:fontsize=17:x=$((rx+27)):y=262:${SHADOW}[rp17];"
+    CHAIN+="[rp17]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_pressure.txt:reload=1:fontcolor=white:fontsize=17:x=$((rx+27)):y=288:${SHADOW}[rp18];"
+
+    CHAIN+="[rp18]drawbox=x=$((rx+27)):y=320:w=294:h=2:color=${GOLD}@0.4:t=fill[rp19];"
+    CHAIN+="[rp19]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_wind_label.txt:fontcolor=${GOLD}@0.85:fontsize=12:x=$((rx+27)):y=332[rp20];"
+    CHAIN+="[rp20]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/rp_spark.txt:reload=1:fontcolor=${GOLD}:fontsize=26:x=$((rx+27)):y=352[rp_end];"
+
+    local prev="rp_end"
     for i in "${!RAW_LINES[@]}"; do
         idx=$((i + 1))
         local start=$((i * SLOT))
@@ -754,6 +896,20 @@ build_final_filter() {
 # Up-next bumper: short branded title card
 # streamed between videos to reduce drop-off
 # at the loop/transition point.
+#
+# FRAME-RATE NOTE: this used to render at -r 24
+# while run_video() renders the main stream at
+# -r 30. Sending two different frame rates down
+# the same RTMP connection (main video -> bumper
+# -> next main video -> ...) is what caused
+# duplicated/dropped frames on YouTube's side at
+# every transition — the ingest has to
+# reconcile timestamps across the switch. Now
+# locked to -r 30 to match run_video() exactly,
+# with -g/-keyint_min left at 60 so the keyframe
+# interval (2s at 30fps) also matches the main
+# stream instead of drifting to 2.5s like it did
+# at 24fps.
 #############################################
 run_bumper() {
     local next_url="$1"
@@ -801,7 +957,7 @@ run_bumper() {
     -filter_complex "$BFILTER" \
     -map "[final]" \
     -map 1:a \
-    -r 24 \
+    -r 30 \
     -s 1280x720 \
     -c:v libx264 \
     -preset ultrafast \
