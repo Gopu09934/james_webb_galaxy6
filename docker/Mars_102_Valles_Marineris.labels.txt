@@ -1,4 +1,4 @@
-467,224,Layered Rock
-695,318,Weathered Rock
-574,467,Dark Basalt
-846,391,Exposed Bedrock
+491,432,Hellas Planitia
+668,176,Utopia Planitia
+803,354,Elysium Planitia
+557,521,Arabia Terra
