@@ -1,3 +1,4 @@
-739,128,RIMFAX Survey Area
-1024,314,Layered Terrain
-414,233,Remote Science Point
+491,432,Weathered Rock
+668,176,Rock Ridge
+803,354,Dark Rock
+557,521,Exposed Rock
