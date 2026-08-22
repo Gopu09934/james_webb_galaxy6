@@ -1,3 +1,4 @@
-613,86,Mars Regolith
-949,520,River Delta
-1191,154,Wind-Carved Rock
+453,298,Valles Marineris
+716,241,Candor Chasma
+592,389,Noctis Labyrinthus
+824,548,Coprates Chasma
