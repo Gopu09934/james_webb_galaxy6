@@ -1,3 +1,4 @@
-920,352,Jezero Crater
-580,428,Martian Dust
-1037,90,Rippled Sand
+453,298,Basalt Outcrop
+716,241,Rock Fragment
+592,389,Ancient Bedrock
+824,548,Layered Outcrop
