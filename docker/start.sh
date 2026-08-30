@@ -105,6 +105,221 @@ RETRY_DELAY=5        # seconds between retries
 mkdir -p "$ASSET_DIR"
 
 #############################################
+# ============================================
+# NARRATION / MUSIC CONFIG (NEW)
+# ============================================
+# NARRATION_URL        : comma-separated list of narration audio
+#                        sources — local file paths OR remote URLs
+#                        (anything ffmpeg's -i can open), e.g.
+#                          NARRATION_URL="https://.../part1.mp3,https://.../part2.mp3"
+#                        Mirrors how VIDEO_URL already supports multiple
+#                        comma-separated entries. All sources are
+#                        downloaded/normalized and concatenated in the
+#                        order given into one combined narration track
+#                        BEFORE the cinematic gap-splice below runs, so
+#                        "audiourl1,audiourl2,audiourl3" all play back
+#                        to back seamlessly. If NARRATION_URL isn't set,
+#                        falls back to a local ./my_audio.mp3 if present
+#                        (old single-file behavior).
+#
+# BACKGROUND_SOUND_URL : same idea, comma-separated list of music-bed
+#                        sources. All are concatenated into one master
+#                        music file that then loops (-stream_loop -1 in
+#                        run_video()) for the whole stream, so multiple
+#                        tracks play through in order and then repeat
+#                        from the first one. Falls back to a local
+#                        ./background_sound.mp3 if the env var isn't set.
+#
+# NARRATION_FILE : built once at startup — the COMBINED voice track
+#                  re-cut into the cinematic pattern:
+#                    40s voice -> 15s silence -> ~33s voice -> 15s
+#                    silence -> ~33s voice -> ... (repeats across the
+#                    whole length of the combined narration).
+#                  This is a real splice (silence is *inserted*, not
+#                  overlaid), so no narration content is ever lost or
+#                  skipped — the timeline just gets longer.
+# BGM_FILE       : the combined/looping background-music master built
+#                  from BACKGROUND_SOUND_URL (or the local fallback).
+#
+# The original video's own audio track is always dropped (muted) — see
+# run_video()'s ffmpeg call, which no longer maps 0:a.
+#
+# Both NARRATION_FILE and BGM_FILE are played with -stream_loop -1 in
+# run_video(), so once the combined list finishes it loops back to the
+# start automatically for as long as the stream keeps running.
+#############################################
+NARRATION_URL="${NARRATION_URL:-}"
+BACKGROUND_SOUND_URL="${BACKGROUND_SOUND_URL:-}"
+MY_VOICE_FILE_DEFAULT="my_audio.mp3"      # legacy single-file fallback
+BGM_FILE_DEFAULT="background_sound.mp3"   # legacy single-file fallback
+
+# Parses a comma-separated list into the named array, trimming
+# whitespace around each entry — identical logic to the VIDEO_URL
+# parsing used later in the stream loop, factored out so both audio
+# lists can reuse it.
+parse_url_list() {
+    local raw="$1" arr_name="$2"
+    local -n _out="$arr_name"
+    _out=()
+    local _tmp=()
+    IFS=',' read -ra _tmp <<< "$raw"
+    local u
+    for u in "${_tmp[@]}"; do
+        u="${u#"${u%%[![:space:]]*}"}"
+        u="${u%"${u##*[![:space:]]}"}"
+        [ -n "$u" ] && _out+=("$u")
+    done
+}
+
+NARRATION_SOURCES=()
+if [ -n "$NARRATION_URL" ]; then
+    parse_url_list "$NARRATION_URL" NARRATION_SOURCES
+    echo "NARRATION_URL provided: ${#NARRATION_SOURCES[@]} narration source(s)."
+elif [ -f "$MY_VOICE_FILE_DEFAULT" ]; then
+    NARRATION_SOURCES=("$MY_VOICE_FILE_DEFAULT")
+    echo "NARRATION_URL not set — using local ${MY_VOICE_FILE_DEFAULT}."
+fi
+
+BGM_SOURCES=()
+if [ -n "$BACKGROUND_SOUND_URL" ]; then
+    parse_url_list "$BACKGROUND_SOUND_URL" BGM_SOURCES
+    echo "BACKGROUND_SOUND_URL provided: ${#BGM_SOURCES[@]} music source(s)."
+elif [ -f "$BGM_FILE_DEFAULT" ]; then
+    BGM_SOURCES=("$BGM_FILE_DEFAULT")
+    echo "BACKGROUND_SOUND_URL not set — using local ${BGM_FILE_DEFAULT}."
+fi
+
+# Downloads/normalizes each entry in a list of audio sources (local
+# paths or remote URLs — ffmpeg's -i transparently handles both) and
+# concatenates them, in the order given, into one combined AAC file.
+# Used for both the narration list and the music-bed list so either can
+# take multiple comma-separated sources and have them play back to
+# back as a single continuous track.
+build_audio_master() {
+    local out_file="$1"; shift
+    local sources=("$@")
+    if [ "${#sources[@]}" -eq 0 ]; then
+        return 1
+    fi
+
+    local work
+    work="$(mktemp -d)"
+    local list="$work/list.txt"
+    : > "$list"
+    local i=0 ok=0 src seg
+
+    for src in "${sources[@]}"; do
+        i=$((i + 1))
+        seg="$work/seg_${i}.wav"
+        echo "Fetching/normalizing audio source ${i}/${#sources[@]}: $src"
+        if ffmpeg -y -i "$src" -ar 48000 -ac 2 -c:a pcm_s16le "$seg" -loglevel error; then
+            echo "file '$(readlink -f "$seg")'" >> "$list"
+            ok=$((ok + 1))
+        else
+            echo "WARNING: could not fetch/decode audio source: $src — skipping it."
+        fi
+    done
+
+    if [ "$ok" -eq 0 ]; then
+        rm -rf "$work"
+        return 1
+    fi
+
+    ffmpeg -y -f concat -safe 0 -i "$list" -c:a aac -b:a 192k "$out_file" -loglevel error
+    rm -rf "$work"
+    [ -s "$out_file" ]
+}
+
+MY_VOICE_MASTER="voice_master.aac"
+NARRATION_FILE="narration_gated.aac"
+NARRATION_AVAILABLE=false
+
+build_narration_track() {
+    local voice_src="$1" out_file="$2"
+    if [ ! -f "$voice_src" ]; then
+        echo "NOTICE: ${voice_src} not found — narration track will be silent (music-only, if provided)."
+        return 0
+    fi
+
+    local work="narration_build"
+    rm -rf "$work"
+    mkdir -p "$work"
+
+    local norm="$work/voice_norm.wav"
+    ffmpeg -y -i "$voice_src" -ar 48000 -ac 2 -c:a pcm_s16le "$norm" -loglevel error
+
+    local total_dur
+    total_dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$norm" 2>/dev/null || echo "")
+    total_dur=${total_dur%.*}
+    if [[ ! "$total_dur" =~ ^[0-9]+$ ]] || [ "$total_dur" -le 0 ]; then
+        echo "WARNING: could not probe ${voice_src} duration — narration track will be silent."
+        return 0
+    fi
+
+    local list="$work/list.txt"
+    : > "$list"
+
+    local pos=0
+    local chunk_len=40     # first voice segment: 40s
+    local seg_idx=0
+
+    while [ "$pos" -lt "$total_dur" ]; do
+        seg_idx=$((seg_idx + 1))
+        local remaining=$((total_dur - pos))
+        local this_len=$chunk_len
+        [ "$this_len" -gt "$remaining" ] && this_len=$remaining
+        [ "$this_len" -lt 1 ] && break
+
+        local seg_file="$work/seg_${seg_idx}.wav"
+        local fade_out_st=$((this_len > 1 ? this_len - 1 : 0))
+        # Short in/out fades so each voice chunk eases into and out of
+        # the silence gap instead of clicking at the cut point.
+        ffmpeg -y -i "$norm" -ss "$pos" -t "$this_len" \
+            -af "afade=t=in:st=0:d=0.3,afade=t=out:st=${fade_out_st}:d=0.3" \
+            -ar 48000 -ac 2 -c:a pcm_s16le "$seg_file" -loglevel error
+        echo "file '$(readlink -f "$seg_file")'" >> "$list"
+
+        pos=$((pos + this_len))
+        chunk_len=33   # every voice segment after the first: ~30-35s (fixed at 33)
+
+        if [ "$pos" -lt "$total_dur" ]; then
+            local gap_file="$work/gap_${seg_idx}.wav"
+            ffmpeg -y -f lavfi -i "anullsrc=r=48000:cl=stereo" -t 15 \
+                -c:a pcm_s16le "$gap_file" -loglevel error
+            echo "file '$(readlink -f "$gap_file")'" >> "$list"
+        fi
+    done
+
+    if [ "$seg_idx" -eq 0 ]; then
+        echo "WARNING: no valid voice segments extracted from ${voice_src} — narration track will be silent."
+        return 0
+    fi
+
+    ffmpeg -y -f concat -safe 0 -i "$list" -c:a aac -b:a 192k "$out_file" -loglevel error
+    if [ -s "$out_file" ]; then
+        NARRATION_AVAILABLE=true
+        echo "Built cinematic narration track: $out_file ($seg_idx voice segment(s), ${total_dur}s source, pattern: 40s voice / 15s gap / ~33s voice / 15s gap / repeat)"
+    else
+        echo "WARNING: narration concat failed — narration track will be silent."
+    fi
+}
+
+if [ "${#NARRATION_SOURCES[@]}" -gt 0 ] && build_audio_master "$MY_VOICE_MASTER" "${NARRATION_SOURCES[@]}"; then
+    echo "Combined ${#NARRATION_SOURCES[@]} narration source(s) -> $MY_VOICE_MASTER"
+    build_narration_track "$MY_VOICE_MASTER" "$NARRATION_FILE"
+else
+    echo "NOTICE: no usable narration audio source (NARRATION_URL / ${MY_VOICE_FILE_DEFAULT}) — narration track will be silent."
+fi
+
+BGM_FILE="bgm_master.aac"
+if [ "${#BGM_SOURCES[@]}" -gt 0 ] && build_audio_master "$BGM_FILE" "${BGM_SOURCES[@]}"; then
+    echo "Combined ${#BGM_SOURCES[@]} background-music source(s) -> $BGM_FILE"
+else
+    echo "NOTICE: no usable background-music source (BACKGROUND_SOUND_URL / ${BGM_FILE_DEFAULT}) — stream will have no background music bed."
+    rm -f "$BGM_FILE" 2>/dev/null || true
+fi
+
+#############################################
 # Generate the coordinate-label marker dot once
 # at startup: a small transparent PNG with a
 # gold-filled center and white ring, matching
@@ -955,6 +1170,53 @@ build_final_filter() {
 }
 
 #############################################
+# build_audio_filter: builds the [aout] audio
+# chain, cinematically ducking the background
+# music bed under narration and letting it swell
+# during the silent gaps that build_narration_track
+# spliced into $NARRATION_FILE.
+#
+# Pattern (mirrors the narration splice exactly):
+#   0-40s        : narration ON  -> music ducked low
+#   40-55s       : narration silent gap (15s) -> music up
+#   55-88s       : narration ON  -> music ducked low
+#   88-103s      : narration silent gap (15s) -> music up
+#   (cycle repeats every 103s)
+#
+# voice_idx / bgm_idx are the ffmpeg input indices (as passed to -i) for
+# the narration track and the music bed, respectively, in run_video().
+#############################################
+AUDIO_CYCLE=103
+AUDIO_ON1_END=40
+AUDIO_GAP1_END=55
+AUDIO_ON2_END=88
+BGM_DUCK_LOW=0.18   # music volume while narration is speaking
+BGM_DUCK_HIGH=1.0   # music volume during the silent narration gaps
+
+build_audio_filter() {
+    local voice_idx="$1" bgm_idx="$2"
+    local DUCK_EXPR="if(between(mod(t\,${AUDIO_CYCLE})\,0\,${AUDIO_ON1_END})+between(mod(t\,${AUDIO_CYCLE})\,${AUDIO_GAP1_END}\,${AUDIO_ON2_END})\,${BGM_DUCK_LOW}\,${BGM_DUCK_HIGH})"
+    local A=""
+
+    if [ -f "$BGM_FILE" ]; then
+        A+="[${bgm_idx}:a]volume=eval=frame:volume='${DUCK_EXPR}':precision=fixed[bgm_duck];"
+    else
+        # No music bed provided — feed silence into bgm_duck so the rest
+        # of the chain (and the amix below) still works unchanged.
+        A+="[${bgm_idx}:a]volume=0.0[bgm_duck];"
+    fi
+
+    if [ "$NARRATION_AVAILABLE" = true ]; then
+        A+="[${voice_idx}:a]anull[voice_v];"
+        A+="[voice_v][bgm_duck]amix=inputs=2:duration=first:normalize=0[aout]"
+    else
+        A+="[bgm_duck]anull[aout]"
+    fi
+
+    echo "$A"
+}
+
+#############################################
 # Up-next bumper: short branded title card
 # streamed between videos to reduce drop-off
 # at the loop/transition point.
@@ -1011,35 +1273,75 @@ run_bumper() {
     BFILTER+="[b7]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.4:fontsize=14:x=(w-text_w)/2:y=470[b8];"
     BFILTER+="[b8]fade=t=in:st=0:d=0.5,fade=t=out:st=${fade_out_start}:d=0.6[final]"
 
-    ffmpeg \
-    -hide_banner \
-    -loglevel warning \
-    -loop 1 -t "$BUMPER_DURATION" -i overlay.png \
-    -f lavfi -t "$BUMPER_DURATION" -i anullsrc=r=48000:cl=stereo \
-    -filter_complex "$BFILTER" \
-    -map "[final]" \
-    -map 1:a \
-    -r 30 \
-    -s 1280x720 \
-    -c:v libx264 \
-    -preset ultrafast \
-    -tune zerolatency \
-    -threads 2 \
-    -profile:v high \
-    -level 4.1 \
-    -pix_fmt yuv420p \
-    -b:v 3000k \
-    -maxrate 3000k \
-    -bufsize 6000k \
-    -g 60 \
-    -keyint_min 60 \
-    -sc_threshold 0 \
-    -c:a aac \
-    -b:a 128k \
-    -ar 48000 \
-    -ac 2 \
-    -f flv \
-    "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" || echo "WARNING: bumper failed, continuing to next video"
+    # Bumper audio: keep the music bed running underneath (at full
+    # volume — nothing to duck against during the bumper since narration
+    # doesn't play here), instead of dead silence, so the music doesn't
+    # visibly cut out every time a bumper plays between videos.
+    local BAFILTER
+    if [ -f "$BGM_FILE" ]; then
+        BAFILTER="[2:a]volume=${BGM_DUCK_HIGH}[aout]"
+        ffmpeg \
+        -hide_banner \
+        -loglevel warning \
+        -loop 1 -t "$BUMPER_DURATION" -i overlay.png \
+        -f lavfi -t "$BUMPER_DURATION" -i anullsrc=r=48000:cl=stereo \
+        -stream_loop -1 -i "$BGM_FILE" \
+        -filter_complex "${BFILTER};${BAFILTER}" \
+        -map "[final]" \
+        -map "[aout]" \
+        -r 30 \
+        -s 1280x720 \
+        -c:v libx264 \
+        -preset ultrafast \
+        -tune zerolatency \
+        -threads 2 \
+        -profile:v high \
+        -level 4.1 \
+        -pix_fmt yuv420p \
+        -b:v 3000k \
+        -maxrate 3000k \
+        -bufsize 6000k \
+        -g 60 \
+        -keyint_min 60 \
+        -sc_threshold 0 \
+        -c:a aac \
+        -b:a 128k \
+        -ar 48000 \
+        -ac 2 \
+        -shortest \
+        -f flv \
+        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" || echo "WARNING: bumper failed, continuing to next video"
+    else
+        ffmpeg \
+        -hide_banner \
+        -loglevel warning \
+        -loop 1 -t "$BUMPER_DURATION" -i overlay.png \
+        -f lavfi -t "$BUMPER_DURATION" -i anullsrc=r=48000:cl=stereo \
+        -filter_complex "$BFILTER" \
+        -map "[final]" \
+        -map 1:a \
+        -r 30 \
+        -s 1280x720 \
+        -c:v libx264 \
+        -preset ultrafast \
+        -tune zerolatency \
+        -threads 2 \
+        -profile:v high \
+        -level 4.1 \
+        -pix_fmt yuv420p \
+        -b:v 3000k \
+        -maxrate 3000k \
+        -bufsize 6000k \
+        -g 60 \
+        -keyint_min 60 \
+        -sc_threshold 0 \
+        -c:a aac \
+        -b:a 128k \
+        -ar 48000 \
+        -ac 2 \
+        -f flv \
+        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" || echo "WARNING: bumper failed, continuing to next video"
+    fi
 }
 
 #############################################
@@ -1071,6 +1373,17 @@ run_video() {
     local filter
     filter=$(build_final_filter "$duration")
 
+    # NOTE: input indices for the audio chain below:
+    #   0 = source video (its own audio is intentionally never mapped —
+    #       original audio stays muted)
+    #   1 = overlay.png
+    #   2 = dot marker
+    #   3 = Mars panel image
+    #   4 = gated narration track (my_audio, re-cut with silence gaps)
+    #   5 = background music bed (background_sound), looped
+    local audio_filter
+    audio_filter=$(build_audio_filter 4 5)
+
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         echo "----------------------------------------"
         echo "Streaming (attempt ${attempt}/${MAX_RETRIES}):"
@@ -1089,9 +1402,11 @@ run_video() {
         -loop 1 -i overlay.png \
         -loop 1 -i "$DOT_MARKER" \
         -loop 1 -i "$MARS_PANEL_IMG" \
-        -filter_complex "$filter" \
+        -stream_loop -1 -i "$NARRATION_FILE" \
+        -stream_loop -1 -i "$BGM_FILE" \
+        -filter_complex "${filter};${audio_filter}" \
         -map "[final]" \
-        -map 0:a? \
+        -map "[aout]" \
         -r 30 \
         -s 1280x720 \
         -c:v libx264 \
