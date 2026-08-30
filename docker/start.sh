@@ -191,10 +191,18 @@ fi
 
 # Downloads/normalizes each entry in a list of audio sources (local
 # paths or remote URLs — ffmpeg's -i transparently handles both) and
-# concatenates them, in the order given, into one combined AAC file.
+# concatenates them, in the order given, into one combined track.
 # Used for both the narration list and the music-bed list so either can
 # take multiple comma-separated sources and have them play back to
 # back as a single continuous track.
+#
+# CONTAINER NOTE: output is .m4a (AAC-in-MP4), not raw .aac (ADTS).
+# Raw ADTS AAC has a well-known problem with `-stream_loop -1`: ffmpeg
+# reopens the bitstream at EOF but the lack of proper container framing
+# means the decoder often doesn't resync, so playback effectively goes
+# silent after the first loop instead of restarting cleanly — which is
+# exactly the "voice plays once, then only music forever" symptom this
+# fixes. .m4a's proper container index loops reliably.
 build_audio_master() {
     local out_file="$1"; shift
     local sources=("$@")
@@ -225,14 +233,27 @@ build_audio_master() {
         return 1
     fi
 
-    ffmpeg -y -f concat -safe 0 -i "$list" -c:a aac -b:a 192k "$out_file" -loglevel error
+    ffmpeg -y -f concat -safe 0 -i "$list" -c:a aac -b:a 192k -movflags +faststart "$out_file" -loglevel error
     rm -rf "$work"
     [ -s "$out_file" ]
 }
 
-MY_VOICE_MASTER="voice_master.aac"
-NARRATION_FILE="narration_gated.aac"
+MY_VOICE_MASTER="voice_master.m4a"
+NARRATION_FILE="narration_gated.m4a"
 NARRATION_AVAILABLE=false
+
+# Fixed cinematic pattern (matches AUDIO_CYCLE/AUDIO_ON1_END/AUDIO_GAP1_END
+# further down, which drive the music-ducking timing — keep both in sync
+# if you ever change these numbers):
+#   40s voice -> 15s music-only -> 40s voice -> 15s music-only -> repeat
+# EVERY voice segment is exactly 40s (clipped shorter only for the very
+# last, partial segment if the source doesn't divide evenly). A 15s gap
+# is inserted after EVERY segment, including the last one — so the loop
+# seam itself (where -stream_loop -1 wraps back to the start of this
+# file) is also a clean music-only gap, not two voice chunks butting
+# together.
+VOICE_CHUNK_SECONDS=40
+GAP_SECONDS=15
 
 build_narration_track() {
     local voice_src="$1" out_file="$2"
@@ -260,13 +281,12 @@ build_narration_track() {
     : > "$list"
 
     local pos=0
-    local chunk_len=40     # first voice segment: 40s
     local seg_idx=0
 
     while [ "$pos" -lt "$total_dur" ]; do
         seg_idx=$((seg_idx + 1))
         local remaining=$((total_dur - pos))
-        local this_len=$chunk_len
+        local this_len=$VOICE_CHUNK_SECONDS
         [ "$this_len" -gt "$remaining" ] && this_len=$remaining
         [ "$this_len" -lt 1 ] && break
 
@@ -280,14 +300,13 @@ build_narration_track() {
         echo "file '$(readlink -f "$seg_file")'" >> "$list"
 
         pos=$((pos + this_len))
-        chunk_len=33   # every voice segment after the first: ~30-35s (fixed at 33)
 
-        if [ "$pos" -lt "$total_dur" ]; then
-            local gap_file="$work/gap_${seg_idx}.wav"
-            ffmpeg -y -f lavfi -i "anullsrc=r=48000:cl=stereo" -t 15 \
-                -c:a pcm_s16le "$gap_file" -loglevel error
-            echo "file '$(readlink -f "$gap_file")'" >> "$list"
-        fi
+        # Gap after EVERY chunk (including the last one) so the file
+        # loops seamlessly — see comment above VOICE_CHUNK_SECONDS.
+        local gap_file="$work/gap_${seg_idx}.wav"
+        ffmpeg -y -f lavfi -i "anullsrc=r=48000:cl=stereo" -t "$GAP_SECONDS" \
+            -c:a pcm_s16le "$gap_file" -loglevel error
+        echo "file '$(readlink -f "$gap_file")'" >> "$list"
     done
 
     if [ "$seg_idx" -eq 0 ]; then
@@ -295,10 +314,10 @@ build_narration_track() {
         return 0
     fi
 
-    ffmpeg -y -f concat -safe 0 -i "$list" -c:a aac -b:a 192k "$out_file" -loglevel error
+    ffmpeg -y -f concat -safe 0 -i "$list" -c:a aac -b:a 192k -movflags +faststart "$out_file" -loglevel error
     if [ -s "$out_file" ]; then
         NARRATION_AVAILABLE=true
-        echo "Built cinematic narration track: $out_file ($seg_idx voice segment(s), ${total_dur}s source, pattern: 40s voice / 15s gap / ~33s voice / 15s gap / repeat)"
+        echo "Built cinematic narration track: $out_file ($seg_idx voice segment(s), ${total_dur}s source, pattern: ${VOICE_CHUNK_SECONDS}s voice / ${GAP_SECONDS}s gap, repeating, loop-seam-safe)"
     else
         echo "WARNING: narration concat failed — narration track will be silent."
     fi
@@ -311,7 +330,7 @@ else
     echo "NOTICE: no usable narration audio source (NARRATION_URL / ${MY_VOICE_FILE_DEFAULT}) — narration track will be silent."
 fi
 
-BGM_FILE="bgm_master.aac"
+BGM_FILE="bgm_master.m4a"
 if [ "${#BGM_SOURCES[@]}" -gt 0 ] && build_audio_master "$BGM_FILE" "${BGM_SOURCES[@]}"; then
     echo "Combined ${#BGM_SOURCES[@]} background-music source(s) -> $BGM_FILE"
 else
@@ -1176,26 +1195,23 @@ build_final_filter() {
 # during the silent gaps that build_narration_track
 # spliced into $NARRATION_FILE.
 #
-# Pattern (mirrors the narration splice exactly):
-#   0-40s        : narration ON  -> music ducked low
-#   40-55s       : narration silent gap (15s) -> music up
-#   55-88s       : narration ON  -> music ducked low
-#   88-103s      : narration silent gap (15s) -> music up
-#   (cycle repeats every 103s)
+# Pattern (mirrors the narration splice exactly — keep these two in
+# sync with VOICE_CHUNK_SECONDS/GAP_SECONDS above if you change them):
+#   0-40s   : narration ON  -> music ducked low
+#   40-55s  : narration silent gap (15s) -> music up
+#   (cycle repeats every 55s — 40s voice, 15s music-only, repeat)
 #
 # voice_idx / bgm_idx are the ffmpeg input indices (as passed to -i) for
 # the narration track and the music bed, respectively, in run_video().
 #############################################
-AUDIO_CYCLE=103
-AUDIO_ON1_END=40
-AUDIO_GAP1_END=55
-AUDIO_ON2_END=88
+AUDIO_CYCLE=$((VOICE_CHUNK_SECONDS + GAP_SECONDS))   # 55
+AUDIO_ON1_END=$VOICE_CHUNK_SECONDS                    # 40
 BGM_DUCK_LOW=0.18   # music volume while narration is speaking
 BGM_DUCK_HIGH=1.0   # music volume during the silent narration gaps
 
 build_audio_filter() {
     local voice_idx="$1" bgm_idx="$2"
-    local DUCK_EXPR="if(between(mod(t\,${AUDIO_CYCLE})\,0\,${AUDIO_ON1_END})+between(mod(t\,${AUDIO_CYCLE})\,${AUDIO_GAP1_END}\,${AUDIO_ON2_END})\,${BGM_DUCK_LOW}\,${BGM_DUCK_HIGH})"
+    local DUCK_EXPR="if(between(mod(t\,${AUDIO_CYCLE})\,0\,${AUDIO_ON1_END})\,${BGM_DUCK_LOW}\,${BGM_DUCK_HIGH})"
     local A=""
 
     if [ -f "$BGM_FILE" ]; then
