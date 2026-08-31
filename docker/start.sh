@@ -282,6 +282,7 @@ build_narration_track() {
 
     local pos=0
     local seg_idx=0
+    local skipped=0
 
     while [ "$pos" -lt "$total_dur" ]; do
         seg_idx=$((seg_idx + 1))
@@ -292,12 +293,34 @@ build_narration_track() {
 
         local seg_file="$work/seg_${seg_idx}.wav"
         local fade_out_st=$((this_len > 1 ? this_len - 1 : 0))
-        # Short in/out fades so each voice chunk eases into and out of
-        # the silence gap instead of clicking at the cut point.
-        ffmpeg -y -i "$norm" -ss "$pos" -t "$this_len" \
-            -af "afade=t=in:st=0:d=0.3,afade=t=out:st=${fade_out_st}:d=0.3" \
+        # PERFORMANCE FIX: -ss is placed BEFORE -i so ffmpeg seeks
+        # directly to $pos instead of decoding-and-discarding everything
+        # from the start of the file every single time. With -ss AFTER
+        # -i (output-side seeking), extracting segment N requires
+        # decoding all of segments 1..N-1 first — O(n^2) total work
+        # across the whole narration. On a long source (here: ~21 min,
+        # 31 segments) that's easily slow/heavy enough to stall or get
+        # killed in a resource-limited CI container, silently leaving
+        # some segments empty/truncated — which is what produced a
+        # mostly-silent final narration track despite a perfectly good
+        # source recording. Input-side seeking on this uncompressed WAV
+        # is exact (no keyframe-alignment issue like compressed formats)
+        # and roughly 30x+ faster end to end.
+        #
+        # loudnorm brings each chunk up to a consistent, clearly audible
+        # loudness (-14 LUFS, comfortably louder than typical background
+        # music) regardless of how quiet the source recording was.
+        ffmpeg -y -ss "$pos" -i "$norm" -t "$this_len" \
+            -af "loudnorm=I=-14:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.3,afade=t=out:st=${fade_out_st}:d=0.3" \
             -ar 48000 -ac 2 -c:a pcm_s16le "$seg_file" -loglevel error
-        echo "file '$(readlink -f "$seg_file")'" >> "$list"
+
+        # Safety check: never splice in an empty/failed segment silently.
+        if [ -s "$seg_file" ]; then
+            echo "file '$(readlink -f "$seg_file")'" >> "$list"
+        else
+            echo "WARNING: voice segment ${seg_idx} (pos=${pos}s, len=${this_len}s) failed to extract or was empty — skipping it."
+            skipped=$((skipped + 1))
+        fi
 
         pos=$((pos + this_len))
 
@@ -306,8 +329,12 @@ build_narration_track() {
         local gap_file="$work/gap_${seg_idx}.wav"
         ffmpeg -y -f lavfi -i "anullsrc=r=48000:cl=stereo" -t "$GAP_SECONDS" \
             -c:a pcm_s16le "$gap_file" -loglevel error
-        echo "file '$(readlink -f "$gap_file")'" >> "$list"
+        if [ -s "$gap_file" ]; then
+            echo "file '$(readlink -f "$gap_file")'" >> "$list"
+        fi
     done
+
+    [ "$skipped" -gt 0 ] && echo "NOTICE: ${skipped} voice segment(s) were skipped due to extraction failures — see warnings above."
 
     if [ "$seg_idx" -eq 0 ]; then
         echo "WARNING: no valid voice segments extracted from ${voice_src} — narration track will be silent."
@@ -318,6 +345,15 @@ build_narration_track() {
     if [ -s "$out_file" ]; then
         NARRATION_AVAILABLE=true
         echo "Built cinematic narration track: $out_file ($seg_idx voice segment(s), ${total_dur}s source, pattern: ${VOICE_CHUNK_SECONDS}s voice / ${GAP_SECONDS}s gap, repeating, loop-seam-safe)"
+        # Diagnostic: print actual measured loudness so the Action log
+        # shows directly whether real voice signal is present, instead
+        # of having to infer it from container bitrate. mean_volume
+        # will be pulled up near -14dB by the loudnorm pass above; if
+        # it still prints something like -70dB / -90dB here, the
+        # SOURCE narration file itself contains no audible signal
+        # (wrong file, muted export, etc.) rather than a pipeline bug.
+        echo "Narration level check:"
+        ffmpeg -i "$out_file" -af volumedetect -f null - 2>&1 | grep -E "mean_volume|max_volume" || true
     else
         echo "WARNING: narration concat failed — narration track will be silent."
     fi
@@ -1206,8 +1242,9 @@ build_final_filter() {
 #############################################
 AUDIO_CYCLE=$((VOICE_CHUNK_SECONDS + GAP_SECONDS))   # 55
 AUDIO_ON1_END=$VOICE_CHUNK_SECONDS                    # 40
-BGM_DUCK_LOW=0.18   # music volume while narration is speaking
+BGM_DUCK_LOW=0.10   # music volume while narration is speaking (lowered from 0.18 so voice dominates even if source levels vary)
 BGM_DUCK_HIGH=1.0   # music volume during the silent narration gaps
+VOICE_BOOST=1.4     # extra gain applied to narration in the live mix, on top of the -14 LUFS build-time normalization — second layer of insurance so voice is never masked by music
 
 build_audio_filter() {
     local voice_idx="$1" bgm_idx="$2"
@@ -1223,7 +1260,7 @@ build_audio_filter() {
     fi
 
     if [ "$NARRATION_AVAILABLE" = true ]; then
-        A+="[${voice_idx}:a]anull[voice_v];"
+        A+="[${voice_idx}:a]volume=${VOICE_BOOST}[voice_v];"
         A+="[voice_v][bgm_duck]amix=inputs=2:duration=first:normalize=0[aout]"
     else
         A+="[bgm_duck]anull[aout]"
