@@ -1339,15 +1339,29 @@ run_bumper() {
     # volume — nothing to duck against during the bumper since narration
     # doesn't play here), instead of dead silence, so the music doesn't
     # visibly cut out every time a bumper plays between videos.
+    #
+    # RELIABILITY: three layers so this can never hang the outer loop
+    # again like it just did:
+    #   1. BGM input is bounded directly with `-t` alongside
+    #      `-stream_loop -1` (loop-but-cap), not left open-ended and
+    #      relying purely on -shortest to catch it downstream.
+    #   2. Explicit `-t "$BUMPER_DURATION"` on the ffmpeg OUTPUT itself
+    #      as a second, independent hard cap.
+    #   3. The whole ffmpeg call is wrapped in `timeout`, so even a
+    #      completely unforeseen hang gets killed after a short grace
+    #      period instead of blocking the stream forever — the loop
+    #      just logs a warning and moves on to the next video.
+    local BUMPER_TIMEOUT=$((BUMPER_DURATION + 20))
     local BAFILTER
+    set +e
     if [ -f "$BGM_FILE" ]; then
         BAFILTER="[2:a]volume=${BGM_DUCK_HIGH}[aout]"
-        ffmpeg \
+        timeout -k 10 "${BUMPER_TIMEOUT}" ffmpeg \
         -hide_banner \
         -loglevel warning \
         -loop 1 -t "$BUMPER_DURATION" -i overlay.png \
         -f lavfi -t "$BUMPER_DURATION" -i anullsrc=r=48000:cl=stereo \
-        -stream_loop -1 -i "$BGM_FILE" \
+        -stream_loop -1 -t "$BUMPER_DURATION" -i "$BGM_FILE" \
         -filter_complex "${BFILTER};${BAFILTER}" \
         -map "[final]" \
         -map "[aout]" \
@@ -1371,10 +1385,14 @@ run_bumper() {
         -ar 48000 \
         -ac 2 \
         -shortest \
+        -t "$BUMPER_DURATION" \
         -f flv \
-        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" || echo "WARNING: bumper failed, continuing to next video"
+        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+        local bumper_exit=$?
+        [ "$bumper_exit" -eq 124 ] && echo "WARNING: bumper timed out after ${BUMPER_TIMEOUT}s and was killed — continuing to next video."
+        [ "$bumper_exit" -ne 0 ] && [ "$bumper_exit" -ne 124 ] && echo "WARNING: bumper failed (exit ${bumper_exit}), continuing to next video."
     else
-        ffmpeg \
+        timeout -k 10 "${BUMPER_TIMEOUT}" ffmpeg \
         -hide_banner \
         -loglevel warning \
         -loop 1 -t "$BUMPER_DURATION" -i overlay.png \
@@ -1401,9 +1419,14 @@ run_bumper() {
         -b:a 128k \
         -ar 48000 \
         -ac 2 \
+        -t "$BUMPER_DURATION" \
         -f flv \
-        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" || echo "WARNING: bumper failed, continuing to next video"
+        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+        local bumper_exit=$?
+        [ "$bumper_exit" -eq 124 ] && echo "WARNING: bumper timed out after ${BUMPER_TIMEOUT}s and was killed — continuing to next video."
+        [ "$bumper_exit" -ne 0 ] && [ "$bumper_exit" -ne 124 ] && echo "WARNING: bumper failed (exit ${bumper_exit}), continuing to next video."
     fi
+    set -e
 }
 
 #############################################
@@ -1446,6 +1469,18 @@ run_video() {
         DURATION_ARGS=(-t "$duration")
     fi
 
+    # Third layer: wrap the whole ffmpeg call in `timeout` as a hard
+    # ceiling. Since -re paces input reading to real time, wall-clock
+    # runtime tracks the video's actual duration closely, so duration+180s
+    # gives generous headroom for startup/reconnects without masking a
+    # genuine hang. If duration probing failed, fall back to a
+    # conservative 1800s (30min) ceiling so an unprobeable video still
+    # can't hang the stream indefinitely.
+    local VIDEO_TIMEOUT=1800
+    if [ -n "$duration" ]; then
+        VIDEO_TIMEOUT=$((duration + 180))
+    fi
+
     # NOTE: input indices for the audio chain below:
     #   0 = source video (its own audio is intentionally never mapped —
     #       original audio stays muted)
@@ -1464,7 +1499,7 @@ run_video() {
         echo "----------------------------------------"
 
         set +e
-        ffmpeg \
+        timeout -k 15 "${VIDEO_TIMEOUT}" ffmpeg \
         -hide_banner \
         -loglevel info \
         -reconnect 1 \
@@ -1511,7 +1546,11 @@ run_video() {
             return 0
         fi
 
-        echo "WARNING: ffmpeg exited with code ${exit_code} (attempt ${attempt}/${MAX_RETRIES})."
+        if [ "$exit_code" -eq 124 ]; then
+            echo "WARNING: ffmpeg timed out after ${VIDEO_TIMEOUT}s and was killed (attempt ${attempt}/${MAX_RETRIES})."
+        else
+            echo "WARNING: ffmpeg exited with code ${exit_code} (attempt ${attempt}/${MAX_RETRIES})."
+        fi
         attempt=$((attempt + 1))
         if [ "$attempt" -le "$MAX_RETRIES" ]; then
             echo "Retrying in ${RETRY_DELAY}s..."
