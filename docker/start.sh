@@ -242,7 +242,7 @@ MY_VOICE_MASTER="voice_master.m4a"
 NARRATION_FILE="narration_gated.m4a"
 NARRATION_AVAILABLE=false
 
-# Fixed cinematic pattern (matches AUDIO_CYCLE/AUDIO_ON1_END/AUDIO_GAP1_END
+# Fixed cinematic pattern (matches AUDIO_CYCLE/AUDIO_ON1_END further
 # further down, which drive the music-ducking timing — keep both in sync
 # if you ever change these numbers):
 #   40s voice -> 15s music-only -> 40s voice -> 15s music-only -> repeat
