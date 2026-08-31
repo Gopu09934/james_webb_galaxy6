@@ -375,6 +375,45 @@ else
 fi
 
 #############################################
+# CROSS-VIDEO AUDIO CONTINUITY (NEW)
+# ============================================
+# Each video streams via its OWN separate ffmpeg process, and every
+# fresh process's `-stream_loop -1 -i "$NARRATION_FILE"` starts reading
+# from position 0 by default. Left alone, that means a long narration
+# (e.g. 20min) playing under short videos (e.g. 5min each) would just
+# replay the same first 5 minutes on every single video, forever.
+#
+# Fix: track how many seconds of narration/music have already been
+# played across the WHOLE running stream (persists across videos within
+# this script's lifetime), and `-ss` (seek) each new ffmpeg process's
+# audio inputs to resume exactly where the previous video left off.
+# NARRATION_TOTAL_DUR/BGM_TOTAL_DUR let that resume position wrap
+# around (modulo) once the full narration/music has played through, so
+# it then loops back to the beginning and continues — never resetting
+# mid-way through on every video boundary again.
+#############################################
+NARRATION_TOTAL_DUR=0
+if [ "$NARRATION_AVAILABLE" = true ] && [ -f "$NARRATION_FILE" ]; then
+    NARRATION_TOTAL_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$NARRATION_FILE" 2>/dev/null || echo "0")
+    NARRATION_TOTAL_DUR=${NARRATION_TOTAL_DUR%.*}
+    [[ "$NARRATION_TOTAL_DUR" =~ ^[0-9]+$ ]] || NARRATION_TOTAL_DUR=0
+    echo "Narration total duration for continuity tracking: ${NARRATION_TOTAL_DUR}s"
+fi
+
+BGM_TOTAL_DUR=0
+if [ -f "$BGM_FILE" ]; then
+    BGM_TOTAL_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$BGM_FILE" 2>/dev/null || echo "0")
+    BGM_TOTAL_DUR=${BGM_TOTAL_DUR%.*}
+    [[ "$BGM_TOTAL_DUR" =~ ^[0-9]+$ ]] || BGM_TOTAL_DUR=0
+    echo "Background music total duration for continuity tracking: ${BGM_TOTAL_DUR}s"
+fi
+
+# Running "playhead" positions (seconds), advanced after every video and
+# every bumper. Updated by run_video()/run_bumper() — see below.
+NARRATION_ELAPSED=0
+BGM_ELAPSED=0
+
+#############################################
 # Generate the coordinate-label marker dot once
 # at startup: a small transparent PNG with a
 # gold-filled center and white ring, matching
@@ -1248,6 +1287,14 @@ build_final_filter() {
 #
 # voice_idx / bgm_idx are the ffmpeg input indices (as passed to -i) for
 # the narration track and the music bed, respectively, in run_video().
+# phase (new): since each video now resumes narration from wherever the
+# previous video left off (see the continuity block above and the -ss
+# seeks in run_video()), the voice/gap boundaries no longer line up with
+# t=0 for this process. phase = however many seconds INTO the current
+# 55s voice/gap cycle the resumed narration position sits at — shifting
+# the duck expression by it keeps the music ducking correctly aligned
+# with the actual audible voice/gap boundaries instead of drifting out
+# of sync every time playback resumes mid-cycle.
 #############################################
 AUDIO_CYCLE=$((VOICE_CHUNK_SECONDS + GAP_SECONDS))   # 55
 AUDIO_ON1_END=$VOICE_CHUNK_SECONDS                    # 40
@@ -1256,8 +1303,8 @@ BGM_DUCK_HIGH=1.0   # music volume during the silent narration gaps
 VOICE_BOOST=1.4     # extra gain applied to narration in the live mix, on top of the -14 LUFS build-time normalization — second layer of insurance so voice is never masked by music
 
 build_audio_filter() {
-    local voice_idx="$1" bgm_idx="$2"
-    local DUCK_EXPR="if(between(mod(t\,${AUDIO_CYCLE})\,0\,${AUDIO_ON1_END})\,${BGM_DUCK_LOW}\,${BGM_DUCK_HIGH})"
+    local voice_idx="$1" bgm_idx="$2" phase="${3:-0}"
+    local DUCK_EXPR="if(between(mod(t+${phase}\,${AUDIO_CYCLE})\,0\,${AUDIO_ON1_END})\,${BGM_DUCK_LOW}\,${BGM_DUCK_HIGH})"
     local A=""
 
     if [ -f "$BGM_FILE" ]; then
@@ -1353,6 +1400,14 @@ run_bumper() {
     #      just logs a warning and moves on to the next video.
     local BUMPER_TIMEOUT=$((BUMPER_DURATION + 20))
     local BAFILTER
+    # CONTINUITY: resume the music bed from where the last video/bumper
+    # left it off (BGM_ELAPSED), so it doesn't restart from 0:00 on
+    # every single bumper — same mechanism as run_video(), see the
+    # "CROSS-VIDEO AUDIO CONTINUITY" block near the top of this script.
+    local bumper_bgm_seek=0
+    if [ -f "$BGM_FILE" ] && [ "$BGM_TOTAL_DUR" -gt 0 ]; then
+        bumper_bgm_seek=$(( BGM_ELAPSED % BGM_TOTAL_DUR ))
+    fi
     set +e
     if [ -f "$BGM_FILE" ]; then
         BAFILTER="[2:a]volume=${BGM_DUCK_HIGH}[aout]"
@@ -1361,7 +1416,7 @@ run_bumper() {
         -loglevel warning \
         -loop 1 -t "$BUMPER_DURATION" -i overlay.png \
         -f lavfi -t "$BUMPER_DURATION" -i anullsrc=r=48000:cl=stereo \
-        -stream_loop -1 -t "$BUMPER_DURATION" -i "$BGM_FILE" \
+        -ss "$bumper_bgm_seek" -stream_loop -1 -t "$BUMPER_DURATION" -i "$BGM_FILE" \
         -filter_complex "${BFILTER};${BAFILTER}" \
         -map "[final]" \
         -map "[aout]" \
@@ -1391,6 +1446,7 @@ run_bumper() {
         local bumper_exit=$?
         [ "$bumper_exit" -eq 124 ] && echo "WARNING: bumper timed out after ${BUMPER_TIMEOUT}s and was killed — continuing to next video."
         [ "$bumper_exit" -ne 0 ] && [ "$bumper_exit" -ne 124 ] && echo "WARNING: bumper failed (exit ${bumper_exit}), continuing to next video."
+        BGM_ELAPSED=$((BGM_ELAPSED + BUMPER_DURATION))
     else
         timeout -k 10 "${BUMPER_TIMEOUT}" ffmpeg \
         -hide_banner \
@@ -1489,8 +1545,39 @@ run_video() {
     #   3 = Mars panel image
     #   4 = gated narration track (my_audio, re-cut with silence gaps)
     #   5 = background music bed (background_sound), looped
+    #
+    # CONTINUITY: resume both narration and music from wherever the
+    # previous video left off (NARRATION_ELAPSED/BGM_ELAPSED), instead
+    # of every fresh ffmpeg process restarting them from position 0 —
+    # see the "CROSS-VIDEO AUDIO CONTINUITY" block near the top of this
+    # script. The modulo wraps back to the start once the full
+    # narration/music has played through, rather than ever going out of
+    # bounds. narration_phase re-aligns the music-ducking envelope to
+    # match wherever we actually resumed within the 40s-voice/15s-gap
+    # cycle, so ducking never drifts out of sync after a resume.
+    local narration_seek=0 bgm_seek=0 narration_phase=0
+    if [ "$NARRATION_AVAILABLE" = true ] && [ "$NARRATION_TOTAL_DUR" -gt 0 ]; then
+        narration_seek=$(( NARRATION_ELAPSED % NARRATION_TOTAL_DUR ))
+        narration_phase=$(( NARRATION_ELAPSED % AUDIO_CYCLE ))
+    fi
+    if [ -f "$BGM_FILE" ] && [ "$BGM_TOTAL_DUR" -gt 0 ]; then
+        bgm_seek=$(( BGM_ELAPSED % BGM_TOTAL_DUR ))
+    fi
+    echo "Audio continuity: resuming narration at ${narration_seek}s, music at ${bgm_seek}s (narration total elapsed so far: ${NARRATION_ELAPSED}s)"
+
     local audio_filter
-    audio_filter=$(build_audio_filter 4 5)
+    audio_filter=$(build_audio_filter 4 5 "$narration_phase")
+
+    # Advance the running playheads by this video's length now, so the
+    # NEXT video (and this one's own retries, which all reuse the same
+    # seek values below) picks up correctly. Approximate is fine here —
+    # exactness to the second doesn't matter for a background continuity
+    # feature, and this keeps the accounting simple regardless of
+    # whether this attempt ultimately succeeds or has to retry.
+    if [ -n "$duration" ]; then
+        NARRATION_ELAPSED=$((NARRATION_ELAPSED + duration))
+        BGM_ELAPSED=$((BGM_ELAPSED + duration))
+    fi
 
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         echo "----------------------------------------"
@@ -1510,8 +1597,8 @@ run_video() {
         -loop 1 -i overlay.png \
         -loop 1 -i "$DOT_MARKER" \
         -loop 1 -i "$MARS_PANEL_IMG" \
-        -stream_loop -1 -i "$NARRATION_FILE" \
-        -stream_loop -1 -i "$BGM_FILE" \
+        -ss "$narration_seek" -stream_loop -1 -i "$NARRATION_FILE" \
+        -ss "$bgm_seek" -stream_loop -1 -i "$BGM_FILE" \
         -filter_complex "${filter};${audio_filter}" \
         -map "[final]" \
         -map "[aout]" \
