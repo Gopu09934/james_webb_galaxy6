@@ -1026,7 +1026,16 @@ prepare_video_content() {
     #########################################
     CHAIN="[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black[video];"
     CHAIN+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
-    CHAIN+="[ovl][video]overlay=0:0[base];"
+    # shortest=1 is critical: [ovl] (overlay.png) is an infinitely
+    # looped image (-loop 1), while [video] (the real source clip) is
+    # finite. Without shortest=1 here, this overlay's output duration
+    # follows the INFINITE base by default, so the whole downstream
+    # filter chain (and therefore the stream) never naturally ends —
+    # ffmpeg just holds/repeats the last frame forever once the real
+    # video ends. shortest=1 ties this back to the real video's actual
+    # length, which is what lets the per-video ffmpeg process exit and
+    # the outer loop advance to the next video.
+    CHAIN+="[ovl][video]overlay=0:0:shortest=1[base];"
 
     # Optional coordinate-based callout labels for this video, drawn onto
     # the raw video before the panel/UI so the panel stays on top.
@@ -1426,6 +1435,17 @@ run_video() {
     local filter
     filter=$(build_final_filter "$duration")
 
+    # Belt-and-suspenders safety net alongside the shortest=1 fix on the
+    # base overlay filter: if we successfully probed the video's real
+    # duration, hard-cap the whole ffmpeg output at exactly that length
+    # with -t. This guarantees the process exits and the outer loop can
+    # advance to the next video, even in the unlikely case something
+    # else in the filter graph ends up producing an unbounded stream.
+    local DURATION_ARGS=()
+    if [ -n "$duration" ]; then
+        DURATION_ARGS=(-t "$duration")
+    fi
+
     # NOTE: input indices for the audio chain below:
     #   0 = source video (its own audio is intentionally never mapped —
     #       original audio stays muted)
@@ -1480,6 +1500,7 @@ run_video() {
         -ar 48000 \
         -ac 2 \
         -shortest \
+        "${DURATION_ARGS[@]}" \
         -f flv \
         "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
         local exit_code=$?
